@@ -10,6 +10,10 @@ Model
 * If the leftover after a cut would be narrower than the kerf it cannot
   yield any usable piece (the blade would eat it entirely), so it is
   treated as trim loss and not represented by a node.
+* Locked placements (pre-positioned pieces) are validated to form a
+  layout that can be recursively decomposed into guillotine cuts with
+  the given kerf; the remaining quantities are then packed only into
+  the usable offcut leaves of that tree (and fresh sheets as needed).
 
 The layout is built with the classic free-rectangle guillotine heuristic:
 pieces are sorted largest-first and each piece is placed into the free
@@ -36,6 +40,12 @@ class UnfitItemError(ValueError):
         )
 
 
+class LockedPlacementError(ValueError):
+    """Raised when locked placements are invalid (unknown item, out of
+    bounds, overlapping, exceeding the demand) or cannot be decomposed
+    into a guillotine cut tree with the given kerf."""
+
+
 @dataclass
 class Piece:
     """One physical piece to place (an item expanded by its quantity)."""
@@ -43,6 +53,20 @@ class Piece:
     item_id: str
     width: float
     height: float
+
+
+@dataclass
+class LockedRect:
+    """One locked placement resolved to absolute sheet coordinates."""
+
+    index: int          # 1-based position in the request's locked list
+    item_id: str
+    x: float
+    y: float
+    width: float        # placed size (already swapped when rotated)
+    height: float
+    rotated: bool
+    piece: Piece        # original (unrotated) item dimensions
 
 
 @dataclass
@@ -98,6 +122,213 @@ def _orientations(piece: Piece):
     yield piece.width, piece.height
     if piece.width != piece.height:
         yield piece.height, piece.width
+
+
+# ---------------------------------------------------------------------------
+# locked placements
+# ---------------------------------------------------------------------------
+
+# Safety net bounding the number of subproblems evaluated while searching
+# for a guillotine decomposition of the locked placements.
+MAX_DECOMPOSE_STEPS = 100_000
+
+
+def _validate_locked(locked: list[tuple[str, float, float, bool]],
+                     item_dims: dict[str, tuple[float, float]],
+                     quantities: dict[str, int],
+                     stock_width: float, stock_height: float) -> list[LockedRect]:
+    """Resolve and validate locked placements against the item list.
+
+    Every locked piece must reference a known item, lie inside the stock,
+    not overlap any other locked piece, and the locked count of an item
+    must not exceed its demand (locked pieces count toward the demand).
+    """
+    rects: list[LockedRect] = []
+    counts: dict[str, int] = {}
+    for position, (item_id, lx, ly, rotated) in enumerate(locked, start=1):
+        if item_id not in item_dims:
+            raise LockedPlacementError(
+                f"locked placement #{position} references unknown item "
+                f"'{item_id}'"
+            )
+        width, height = item_dims[item_id]
+        pw, ph = (height, width) if rotated else (width, height)
+        if (lx < -EPS or ly < -EPS
+                or lx + pw > stock_width + EPS
+                or ly + ph > stock_height + EPS):
+            raise LockedPlacementError(
+                f"locked placement #{position} (item '{item_id}') at "
+                f"(x={lx}, y={ly}) with size {pw} x {ph} exceeds stock "
+                f"{stock_width} x {stock_height}"
+            )
+        counts[item_id] = counts.get(item_id, 0) + 1
+        if counts[item_id] > quantities[item_id]:
+            raise LockedPlacementError(
+                f"locked placements for item '{item_id}' exceed its "
+                f"quantity {quantities[item_id]}"
+            )
+        rects.append(LockedRect(index=position, item_id=item_id, x=lx, y=ly,
+                                width=pw, height=ph, rotated=rotated,
+                                piece=Piece(item_id, width, height)))
+
+    for i, a in enumerate(rects):
+        for b in rects[i + 1:]:
+            overlap_x = min(a.x + a.width, b.x + b.width) - max(a.x, b.x)
+            overlap_y = min(a.y + a.height, b.y + b.height) - max(a.y, b.y)
+            if overlap_x > EPS and overlap_y > EPS:
+                raise LockedPlacementError(
+                    f"locked placements #{a.index} (item '{a.item_id}') and "
+                    f"#{b.index} (item '{b.item_id}') overlap"
+                )
+    return rects
+
+
+def _decompose_locked_layout(rects: list[LockedRect], stock_width: float,
+                             stock_height: float, kerf: float):
+    """Build a cut tree whose item leaves are exactly the locked pieces.
+
+    Returns ``(root, conflicts)``.  ``root`` is the tree root (its free
+    leaves are the usable offcuts) or ``None`` when the locked layout
+    cannot be produced by guillotine cuts with the given kerf; in that
+    case ``conflicts`` holds the index tuples of the sub-layouts that
+    could not be decomposed.
+
+    A region is ``(x, y, x2, y2, right_exact, bottom_exact)``.  Content
+    must always be flush with the region's left/top edges (a cut node
+    places both children at its origin / right after the kerf band).  An
+    "exact" far edge is a cut line: an item leaf must match it exactly,
+    because the parent's next sibling starts exactly ``kerf`` after it.
+    A non-exact far edge may fall short by up to ``kerf`` (trim loss,
+    mirroring how ``_fill`` lets a piece consume a free rectangle).
+    """
+    conflicts: list[tuple[int, ...]] = []
+    failed: set = set()
+    steps = 0
+
+    def edge_ok(rect_edge: float, region_edge: float, exact: bool) -> bool:
+        if exact:
+            return abs(rect_edge - region_edge) <= EPS
+        return -EPS <= region_edge - rect_edge <= kerf + EPS
+
+    def decompose(region, sub) -> Node | None:
+        nonlocal steps
+        steps += 1
+        if steps > MAX_DECOMPOSE_STEPS:
+            raise LockedPlacementError(
+                "locked layout is too complex to verify as guillotine cuts"
+            )
+        x, y, x2, y2, right_exact, bottom_exact = region
+        if not sub:
+            return Node(kind="free", x=x, y=y, width=x2 - x, height=y2 - y)
+        key = (region, tuple(r.index for r in sub))
+        if key in failed:
+            return None
+        if len(sub) == 1:
+            r = sub[0]
+            if (abs(r.x - x) <= EPS and abs(r.y - y) <= EPS
+                    and edge_ok(r.x + r.width, x2, right_exact)
+                    and edge_ok(r.y + r.height, y2, bottom_exact)):
+                return Node(kind="item", x=r.x, y=r.y, width=r.width,
+                            height=r.height, piece=r.piece, rotated=r.rotated)
+        # Try every candidate guillotine cut.  It suffices to cut right
+        # after a piece's far edge or so that the kerf band ends at a
+        # piece's near edge: any valid cut can be shifted to such a
+        # position without changing which pieces it separates.
+        for direction in ("vertical", "horizontal"):
+            if direction == "vertical":
+                cuts = sorted({r.x + r.width for r in sub}
+                              | {r.x - kerf for r in sub})
+            else:
+                cuts = sorted({r.y + r.height for r in sub}
+                              | {r.y - kerf for r in sub})
+            for c in cuts:
+                near, far = (x, x2) if direction == "vertical" else (y, y2)
+                if c - near <= EPS or far - c - kerf <= EPS:
+                    continue
+                first_sub, second_sub = [], []
+                for r in sub:
+                    start = r.x if direction == "vertical" else r.y
+                    end = start + (r.width if direction == "vertical"
+                                   else r.height)
+                    if end <= c + EPS:
+                        first_sub.append(r)
+                    elif start >= c + kerf - EPS:
+                        second_sub.append(r)
+                    else:
+                        break  # piece straddles the kerf band: invalid cut
+                else:
+                    if direction == "vertical":
+                        first_region = (x, y, c, y2, True, False)
+                        second_region = (c + kerf, y, x2, y2, False, False)
+                    else:
+                        first_region = (x, y, x2, c, False, True)
+                        second_region = (x, c + kerf, x2, y2, False, False)
+                    first = decompose(first_region, tuple(first_sub))
+                    if first is None:
+                        continue
+                    second = decompose(second_region, tuple(second_sub))
+                    if second is None:
+                        continue
+                    return Node(kind="cut", x=x, y=y, width=x2 - x,
+                                height=y2 - y, direction=direction,
+                                children=[first, second])
+        failed.add(key)
+        conflicts.append(tuple(r.index for r in sub))
+        return None
+
+    root = decompose((0.0, 0.0, stock_width, stock_height, False, False),
+                     tuple(rects))
+    return root, conflicts
+
+
+def _collect_free(node: Node, out: list[Node]) -> None:
+    """Collect the free (usable offcut) leaves of a decomposed layout."""
+    if node.kind == "free":
+        out.append(node)
+    elif node.kind == "cut":
+        for child in node.children:
+            _collect_free(child, out)
+
+
+def _locked_sheet(rects: list[LockedRect], stock_width: float,
+                  stock_height: float, kerf: float) -> Sheet:
+    """Build the first sheet from validated locked placements."""
+    root, conflicts = _decompose_locked_layout(rects, stock_width,
+                                               stock_height, kerf)
+    if root is None:
+        by_index = {r.index: r for r in rects}
+        worst = min(conflicts, key=lambda c: (len(c), c))
+        detail = ", ".join(
+            f"#{i} (item '{by_index[i].item_id}', x={by_index[i].x}, "
+            f"y={by_index[i].y}, rotated={by_index[i].rotated})"
+            for i in worst
+        )
+        raise LockedPlacementError(
+            f"locked placements cannot be decomposed into a guillotine cut "
+            f"tree with kerf {kerf}; conflicting placements: {detail}"
+        )
+    free: list[Node] = []
+    _collect_free(root, free)
+    return Sheet(
+        width=stock_width,
+        height=stock_height,
+        kerf=kerf,
+        root=root,
+        free=free,
+        placements=[
+            {
+                "item": r.item_id,
+                "x": _num(r.x),
+                "y": _num(r.y),
+                "width": _num(r.width),
+                "height": _num(r.height),
+                "rotated": r.rotated,
+                "locked": True,
+            }
+            for r in rects
+        ],
+        used_area=sum(r.width * r.height for r in rects),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +466,7 @@ def _place(sheet: Sheet, free_idx: int, piece: Piece, pw: float, ph: float) -> N
         "width": _num(pw),
         "height": _num(ph),
         "rotated": not (pw == piece.width and ph == piece.height),
+        "locked": False,
     })
 
 
@@ -286,24 +518,51 @@ def _node_dict(node: Node) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_plan(stock_width: float, stock_height: float, kerf: float,
-               items: list[tuple[str, float, float, int]]) -> dict:
+               items: list[tuple[str, float, float, int]],
+               locked: list[tuple[str, float, float, bool]] | None = None
+               ) -> dict:
     """Pack ``items`` (id, width, height, quantity) onto stock sheets.
 
+    ``locked`` optionally lists pre-positioned pieces (id, x, y, rotated)
+    for the first sheet.  Locked pieces count toward the demand of their
+    item; the layout is validated and decomposed into a guillotine cut
+    tree first, then the remaining quantities are packed into the usable
+    offcut leaves of that tree (and fresh sheets as needed).
+
     Returns a dict matching the PlanResponse schema.  Raises
-    UnfitItemError if any item cannot fit on a fresh sheet.
+    UnfitItemError if any item cannot fit on a fresh sheet and
+    LockedPlacementError if the locked placements are invalid.
     """
-    pieces: list[Piece] = []
+    item_dims: dict[str, tuple[float, float]] = {}
+    quantities: dict[str, int] = {}
     for item_id, width, height, quantity in items:
         if not (_fits(width, height, stock_width, stock_height)
                 or _fits(height, width, stock_width, stock_height)):
-            raise UnfitItemError(item_id, width, height, stock_width, stock_height)
-        pieces.extend(Piece(item_id, width, height) for _ in range(quantity))
+            raise UnfitItemError(item_id, width, height, stock_width,
+                                 stock_height)
+        item_dims[item_id] = (width, height)
+        quantities[item_id] = quantities.get(item_id, 0) + quantity
+
+    locked_rects = _validate_locked(locked or [], item_dims, quantities,
+                                    stock_width, stock_height)
+    locked_count: dict[str, int] = {}
+    for rect in locked_rects:
+        locked_count[rect.item_id] = locked_count.get(rect.item_id, 0) + 1
+
+    pieces: list[Piece] = []
+    for item_id, width, height, quantity in items:
+        remaining = quantity - locked_count.get(item_id, 0)
+        pieces.extend(Piece(item_id, width, height) for _ in range(remaining))
 
     # Largest first: longer max side, then larger area.
     pieces.sort(key=lambda p: (max(p.width, p.height), p.width * p.height),
                 reverse=True)
 
     sheets: list[Sheet] = []
+    if locked_rects:
+        sheets.append(_locked_sheet(locked_rects, stock_width, stock_height,
+                                    kerf))
+
     for piece in pieces:
         found = _best_fit(sheets, piece)
         if found is None:
@@ -342,7 +601,7 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
         "sheets": result_sheets,
         "summary": {
             "sheet_count": len(sheets),
-            "piece_count": len(pieces),
+            "piece_count": len(pieces) + len(locked_rects),
             "used_area": _num(total_used),
             "stock_area": _num(len(sheets) * sheet_area),
             "utilization": round(total_used / (len(sheets) * sheet_area), 6),

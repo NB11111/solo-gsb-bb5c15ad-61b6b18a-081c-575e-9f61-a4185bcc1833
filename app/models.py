@@ -11,6 +11,7 @@ MAX_KERF = 1_000.0
 MAX_ITEM_TYPES = 500
 MAX_QUANTITY = 100_000
 MAX_TOTAL_PIECES = 20_000
+MAX_LOCKED_PLACEMENTS = 200
 
 
 # ---------------------------------------------------------------------------
@@ -32,12 +33,27 @@ class Item(BaseModel):
     quantity: int = Field(ge=1, le=MAX_QUANTITY, description="需求数量")
 
 
+class LockedPlacement(BaseModel):
+    item: str = Field(
+        min_length=1, max_length=64,
+        description="成品标识，须对应某个 items[].id（含自动生成的 item-N）",
+    )
+    x: float = Field(ge=0.0, le=MAX_DIMENSION, description="左上角 X 坐标")
+    y: float = Field(ge=0.0, le=MAX_DIMENSION, description="左上角 Y 坐标")
+    rotated: bool = Field(default=False, description="是否旋转 90 度")
+
+
 class PlanRequest(BaseModel):
     stock: Stock = Field(description="原纸尺寸")
     kerf: float = Field(default=0.0, ge=0.0, le=MAX_KERF,
                         description="切缝宽度，每次切割损耗的材料宽度")
     items: list[Item] = Field(min_length=1, max_length=MAX_ITEM_TYPES,
                               description="成品尺寸及数量")
+    locked_placements: list[LockedPlacement] = Field(
+        default_factory=list, max_length=MAX_LOCKED_PLACEMENTS,
+        description="预先定位在第一张原纸上的成品：数量计入对应需求，"
+                    "布局必须能按切缝递归分解为铡刀切割",
+    )
 
     @model_validator(mode="after")
     def _check_request(self) -> "PlanRequest":
@@ -63,6 +79,8 @@ class Placement(BaseModel):
     width: float = Field(description="放置后的宽度（旋转后为原高度）")
     height: float = Field(description="放置后的高度")
     rotated: bool = Field(description="是否旋转了 90 度")
+    locked: bool = Field(default=False,
+                         description="是否为预先定位（锁定）的成品")
 
 
 class ItemNode(BaseModel):

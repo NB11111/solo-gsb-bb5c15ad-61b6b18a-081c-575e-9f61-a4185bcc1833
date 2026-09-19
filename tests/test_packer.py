@@ -16,7 +16,7 @@ class TestBasicPacking:
         assert sheet["utilization"] == 1.0
         assert sheet["placements"] == [
             {"item": "A", "x": 0, "y": 0, "width": 100, "height": 100,
-             "rotated": False}
+             "rotated": False, "locked": False}
         ]
         assert sheet["cut_tree"]["type"] == "item"
 

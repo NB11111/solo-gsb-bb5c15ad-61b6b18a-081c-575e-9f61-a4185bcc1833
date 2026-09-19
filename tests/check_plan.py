@@ -1,7 +1,12 @@
 """Shared validators asserting a plan is physically and structurally sound."""
 from __future__ import annotations
 
-EPS = 1e-6
+# Tolerance for geometric relations.  Response coordinates are rounded to
+# 6 decimals (±0.5e-6 each), so a relation over up to four coordinates may
+# drift by ~2e-6 from the exact arithmetic the planner used internally;
+# 5e-6 absorbs that rounding noise while remaining far below any
+# physically meaningful cutting tolerance.
+EPS = 5e-6
 
 
 def iter_leaves(node: dict):

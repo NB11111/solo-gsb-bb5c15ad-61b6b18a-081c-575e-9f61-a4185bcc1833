@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .models import PlanRequest, PlanResponse
-from .packer import UnfitItemError, build_plan
+from .packer import LockedPlacementError, UnfitItemError, build_plan
 
 app = FastAPI(
     title="Guillotine Cutting Plan API",
@@ -48,12 +48,18 @@ def create_plan(request: PlanRequest) -> dict:
         seen_ids.add(item_id)
         items.append((item_id, item.width, item.height, item.quantity))
 
+    locked = [
+        (placement.item, placement.x, placement.y, placement.rotated)
+        for placement in request.locked_placements
+    ]
+
     try:
         return build_plan(
             stock_width=request.stock.width,
             stock_height=request.stock.height,
             kerf=request.kerf,
             items=items,
+            locked=locked,
         )
-    except UnfitItemError as exc:
+    except (UnfitItemError, LockedPlacementError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
