@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .models import PlanRequest, PlanResponse
-from .packer import UnfitItemError, build_plan
+from .packer import LockedLayoutError, UnfitItemError, build_plan
 
 app = FastAPI(
     title="Guillotine Cutting Plan API",
@@ -35,6 +35,7 @@ def health() -> dict:
 def create_plan(request: PlanRequest) -> dict:
     items = []
     seen_ids = set()
+    quantities = {}
     for position, item in enumerate(request.items, start=1):
         item_id = item.id or f"item-{position}"
         if item_id in seen_ids:
@@ -47,6 +48,32 @@ def create_plan(request: PlanRequest) -> dict:
             )
         seen_ids.add(item_id)
         items.append((item_id, item.width, item.height, item.quantity))
+        quantities[item_id] = item.quantity
+
+    locked = []
+    locked_counts: dict[str, int] = {}
+    for ref, placement in enumerate(request.locked_placements, start=1):
+        item_id = placement.item
+        if item_id not in seen_ids:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"locked placement #{ref} references unknown item "
+                    f"'{item_id}': it must match an id in items"
+                ),
+            )
+        locked_counts[item_id] = locked_counts.get(item_id, 0) + 1
+        if locked_counts[item_id] > quantities[item_id]:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"locked placement #{ref} for item '{item_id}' exceeds its "
+                    f"requested quantity ({quantities[item_id]}): locked "
+                    "placements count towards the requirement"
+                ),
+            )
+        locked.append((item_id, placement.x, placement.y,
+                       placement.rotated, ref))
 
     try:
         return build_plan(
@@ -54,6 +81,7 @@ def create_plan(request: PlanRequest) -> dict:
             stock_height=request.stock.height,
             kerf=request.kerf,
             items=items,
+            locked=locked,
         )
-    except UnfitItemError as exc:
+    except (UnfitItemError, LockedLayoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
